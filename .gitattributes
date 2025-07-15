@@ -1,2 +1,17 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+Logs
+*.log
+logs/
+Node data
+data/
+accounts/
+*.pid
+Backups
+*.tar.gz
+backups/
+System files
+.DS_Store
+Thumbs.db
+Editor files
+*.swp
+*.swo
+*~
