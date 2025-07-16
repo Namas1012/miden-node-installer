@@ -1,5 +1,5 @@
 #!/bin/bash
-# Miden Node Operator - Root Installation Script
+# Miden Node Operator - Root Installation Script (FIXED VERSION)
 
 set -e
 
@@ -21,7 +21,7 @@ MIDEN_DATA_DIR="$MIDEN_HOME/data"
 MIDEN_ACCOUNTS_DIR="$MIDEN_HOME/accounts"
 MIDEN_CONFIG_DIR="$MIDEN_HOME/config"
 MIDEN_LOGS_DIR="$MIDEN_HOME/logs"
-RUST_VERSION="1.88.0"
+RUST_VERSION="1.82"
 
 log "Starting Miden Node Operator installation..."
 
@@ -29,6 +29,18 @@ log "Starting Miden Node Operator installation..."
 if [[ $EUID -ne 0 ]]; then
    error "This script must be run as root"
    exit 1
+fi
+
+# Check OS compatibility
+if ! grep -E "(Ubuntu|Debian)" /etc/os-release > /dev/null; then
+    warn "This script is designed for Ubuntu/Debian. Continuing anyway..."
+fi
+
+# Check disk space (at least 100GB)
+AVAILABLE_SPACE=$(df / | tail -1 | awk '{print $4}')
+if [ $AVAILABLE_SPACE -lt 104857600 ]; then  # 100GB in KB
+    error "Insufficient disk space. At least 100GB required."
+    exit 1
 fi
 
 # Update system
@@ -48,6 +60,8 @@ apt install -y \
     pkg-config \
     libssl-dev \
     libsqlite3-dev \
+    protobuf-compiler \
+    libprotobuf-dev \
     software-properties-common \
     unzip \
     jq \
@@ -69,25 +83,51 @@ log "Installing Rust $RUST_VERSION..."
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain $RUST_VERSION
 source ~/.cargo/env
 
-# Install miden-node
-log "Installing miden-node..."
-~/.cargo/bin/cargo install miden-node --locked
+# Verify Rust installation
+RUST_INSTALLED_VERSION=$(~/.cargo/bin/rustc --version | cut -d' ' -f2)
+log "Rust installed: $RUST_INSTALLED_VERSION"
+
+# Install miden-node with testing features (FIXED)
+log "Installing miden-node with testing features..."
+~/.cargo/bin/cargo install miden-node --locked --features testing
 
 # Verify installation
 log "Verifying miden-node installation..."
 if ~/.cargo/bin/miden-node --version &>/dev/null; then
-    log "Miden node installed successfully"
+    VERSION=$(~/.cargo/bin/miden-node --version)
+    log "Miden node installed successfully: $VERSION"
 else
     error "Failed to install miden-node"
     exit 1
 fi
 
-# Bootstrap node
-log "Bootstrapping Miden node..."
+# Initialize node configuration (FIXED)
+log "Initializing Miden node configuration..."
 cd "$MIDEN_HOME"
-~/.cargo/bin/miden-node bundled bootstrap \
-    --data-directory "$MIDEN_DATA_DIR" \
-    --accounts-directory "$MIDEN_ACCOUNTS_DIR"
+~/.cargo/bin/miden-node init \
+    --config-path "$MIDEN_CONFIG_DIR/miden-node.toml" \
+    --genesis-path "$MIDEN_CONFIG_DIR/genesis.toml"
+
+if [ $? -ne 0 ]; then
+    error "Failed to initialize node configuration"
+    exit 1
+fi
+
+# Generate genesis block (FIXED - NEW STEP)
+log "Generating genesis block..."
+~/.cargo/bin/miden-node genesis \
+    --genesis-path "$MIDEN_CONFIG_DIR/genesis.toml" \
+    --output-path "$MIDEN_DATA_DIR/genesis.dat"
+
+if [ $? -ne 0 ]; then
+    error "Failed to generate genesis block"
+    exit 1
+fi
+
+# Bootstrap the node (FIXED)
+log "Bootstrapping Miden node..."
+~/.cargo/bin/miden-node bootstrap \
+    --config-path "$MIDEN_CONFIG_DIR/miden-node.toml"
 
 if [ $? -eq 0 ]; then
     log "Bootstrap completed successfully!"
@@ -103,30 +143,46 @@ curl -L https://github.com/fullstorydev/grpcurl/releases/download/v1.8.9/grpcurl
 cd /tmp && tar -xzf grpcurl.tar.gz
 chmod +x grpcurl
 mv grpcurl /usr/local/bin/
+rm -f /tmp/grpcurl.tar.gz
 
 # Create management scripts
 log "Creating management scripts..."
 
-# Start script
+# Start script (FIXED)
 cat > /root/start_miden.sh << 'SCRIPT'
 #!/bin/bash
 source ~/.cargo/env
 cd /root/miden
 
+# Check if already running
+if [ -f miden-node.pid ]; then
+    PID=$(cat miden-node.pid)
+    if kill -0 $PID 2>/dev/null; then
+        echo "❌ Miden Node already running with PID: $PID"
+        exit 1
+    else
+        rm miden-node.pid
+    fi
+fi
+
 echo "Starting Miden Node..."
-nohup ~/.cargo/bin/miden-node bundled start \
-    --rpc.url "http://0.0.0.0:26657" \
-    --data-directory "$PWD/data" \
-    --block.interval 5s \
-    --batch.interval 2s \
-    --max-txs-per-batch 8 \
-    --max-batches-per-block 8 \
+nohup ~/.cargo/bin/miden-node start \
+    --config "$PWD/config/miden-node.toml" \
     > logs/miden-node.log 2>&1 &
 
 echo $! > miden-node.pid
-echo "✅ Miden Node started with PID: $(cat miden-node.pid)"
-echo "📁 Log file: $PWD/logs/miden-node.log"
-echo "🌐 RPC endpoint: http://0.0.0.0:26657"
+sleep 2
+
+# Verify it started
+if kill -0 $(cat miden-node.pid) 2>/dev/null; then
+    echo "✅ Miden Node started with PID: $(cat miden-node.pid)"
+    echo "📁 Log file: $PWD/logs/miden-node.log"
+    echo "🌐 RPC endpoint: http://0.0.0.0:26657"
+else
+    echo "❌ Failed to start Miden Node"
+    rm miden-node.pid
+    exit 1
+fi
 SCRIPT
 
 # Stop script
@@ -141,6 +197,7 @@ if [ -f miden-node.pid ]; then
         kill $PID
         sleep 5
         if kill -0 $PID 2>/dev/null; then
+            echo "Force killing..."
             kill -9 $PID
         fi
         rm miden-node.pid
@@ -154,7 +211,7 @@ else
 fi
 SCRIPT
 
-# Status script
+# Status script (enhanced)
 cat > /root/status_miden.sh << 'SCRIPT'
 #!/bin/bash
 cd /root/miden
@@ -165,16 +222,18 @@ if [ -f miden-node.pid ]; then
     PID=$(cat miden-node.pid)
     if kill -0 $PID 2>/dev/null; then
         echo "✅ Status: RUNNING (PID: $PID)"
-        echo "📊 Memory: $(ps -o rss --no-headers -p $PID) KB"
-        echo "⏰ Uptime: $(ps -o etime --no-headers -p $PID)"
+        echo "📊 Memory: $(ps -o rss --no-headers -p $PID | tr -d ' ') KB"
+        echo "⏰ Uptime: $(ps -o etime --no-headers -p $PID | tr -d ' ')"
         
-        # Latest block
-        LATEST_BLOCK=$(grep -o "block_num: [0-9]*" logs/miden-node.log | tail -1 | cut -d' ' -f2)
-        [ ! -z "$LATEST_BLOCK" ] && echo "🏗️ Latest block: $LATEST_BLOCK"
+        # Latest block from logs
+        if [ -f logs/miden-node.log ]; then
+            LATEST_BLOCK=$(grep -o "block.*[0-9]" logs/miden-node.log | tail -1 2>/dev/null || echo "No block info")
+            echo "🏗️ Latest: $LATEST_BLOCK"
+        fi
         
         # Network ports
         echo "🌐 Listening ports:"
-        ss -tlnp | grep $PID | while read line; do
+        ss -tlnp | grep $PID 2>/dev/null | while read line; do
             PORT=$(echo "$line" | awk '{print $4}' | cut -d':' -f2)
             echo "   Port $PORT: LISTENING"
         done
@@ -189,15 +248,20 @@ fi
 # RPC test
 echo ""
 echo "🔍 RPC Test:"
-if curl -s --connect-timeout 3 http://localhost:26657 > /dev/null 2>&1; then
+if timeout 3 curl -s http://localhost:26657 > /dev/null 2>&1; then
     echo "✅ RPC accessible"
 else
     echo "❌ RPC not accessible"
 fi
 
+# Show recent logs
 echo ""
 echo "📋 Recent logs:"
-tail -5 logs/miden-node.log
+if [ -f logs/miden-node.log ]; then
+    tail -5 logs/miden-node.log 2>/dev/null || echo "No logs available"
+else
+    echo "Log file not found"
+fi
 SCRIPT
 
 # Restart script
@@ -205,11 +269,11 @@ cat > /root/restart_miden.sh << 'SCRIPT'
 #!/bin/bash
 echo "Restarting Miden Node..."
 /root/stop_miden.sh
-sleep 2
+sleep 3
 /root/start_miden.sh
 SCRIPT
 
-# Client script
+# Client script (improved error handling)
 cat > /root/miden_client.sh << 'SCRIPT'
 #!/bin/bash
 RPC_URL="localhost:26657"
@@ -228,25 +292,37 @@ show_help() {
     echo "  help                  - Show this help"
 }
 
+# Check if grpcurl is available
+if ! command -v grpcurl &> /dev/null; then
+    echo "❌ grpcurl not found. Please install it first."
+    exit 1
+fi
+
+# Check if RPC is accessible
+if ! timeout 3 curl -s http://$RPC_URL > /dev/null 2>&1; then
+    echo "❌ RPC not accessible at $RPC_URL"
+    exit 1
+fi
+
 case "$1" in
     "latest")
-        grpcurl -plaintext -d '{}' $RPC_URL $SERVICE/GetBlockHeaderByNumber
+        grpcurl -plaintext -d '{}' $RPC_URL $SERVICE/GetBlockHeaderByNumber 2>/dev/null || echo "❌ Failed to get latest block"
         ;;
     "block")
         if [ -z "$2" ]; then
             echo "Usage: $0 block <number>"
             exit 1
         fi
-        grpcurl -plaintext -d "{\"block_num\": $2}" $RPC_URL $SERVICE/GetBlockHeaderByNumber
+        grpcurl -plaintext -d "{\"block_num\": $2}" $RPC_URL $SERVICE/GetBlockHeaderByNumber 2>/dev/null || echo "❌ Failed to get block $2"
         ;;
     "status")
-        grpcurl -plaintext -d '{}' $RPC_URL $SERVICE/Status
+        grpcurl -plaintext -d '{}' $RPC_URL $SERVICE/Status 2>/dev/null || echo "❌ Failed to get status"
         ;;
     "methods")
-        grpcurl -plaintext $RPC_URL list $SERVICE
+        grpcurl -plaintext $RPC_URL list $SERVICE 2>/dev/null || echo "❌ Failed to list methods"
         ;;
     "services")
-        grpcurl -plaintext $RPC_URL list
+        grpcurl -plaintext $RPC_URL list 2>/dev/null || echo "❌ Failed to list services"
         ;;
     "help"|""|*)
         show_help
@@ -280,6 +356,7 @@ show_help() {
     echo "  faucet        - Show faucet key"
     echo "  backup        - Backup node data"
     echo "  reset         - Reset and reinitialize"
+    echo "  version       - Show node version"
 }
 
 case "$1" in
@@ -296,7 +373,11 @@ case "$1" in
         /root/status_miden.sh
         ;;
     "logs")
-        tail -f /root/miden/logs/miden-node.log
+        if [ -f /root/miden/logs/miden-node.log ]; then
+            tail -f /root/miden/logs/miden-node.log
+        else
+            echo "❌ Log file not found"
+        fi
         ;;
     "latest")
         /root/miden_client.sh latest
@@ -312,19 +393,32 @@ case "$1" in
         ;;
     "faucet")
         echo "🚰 Faucet Key:"
-        cat /root/miden/accounts/faucet_miden.mac
+        if [ -f /root/miden/accounts/faucet_miden.mac ]; then
+            cat /root/miden/accounts/faucet_miden.mac
+        else
+            echo "❌ Faucet key not found"
+        fi
         ;;
     "backup")
         BACKUP_FILE="/root/miden_backup_$(date +%Y%m%d_%H%M%S).tar.gz"
-        tar -czf "$BACKUP_FILE" -C /root miden/
-        echo "✅ Backup created: $BACKUP_FILE"
+        if tar -czf "$BACKUP_FILE" -C /root miden/ 2>/dev/null; then
+            echo "✅ Backup created: $BACKUP_FILE"
+        else
+            echo "❌ Backup failed"
+        fi
         ;;
     "reset")
         /root/stop_miden.sh
         cd /root/miden
-        rm -rf data/* accounts/* logs/*
-        ~/.cargo/bin/miden-node bundled bootstrap --data-directory data --accounts-directory accounts
+        rm -rf data/* accounts/* logs/* config/*
+        echo "🔄 Reinitializing..."
+        ~/.cargo/bin/miden-node init --config-path config/miden-node.toml --genesis-path config/genesis.toml
+        ~/.cargo/bin/miden-node genesis --genesis-path config/genesis.toml --output-path data/genesis.dat
+        ~/.cargo/bin/miden-node bootstrap --config-path config/miden-node.toml
         echo "✅ Node reset and reinitialized"
+        ;;
+    "version")
+        ~/.cargo/bin/miden-node --version
         ;;
     *)
         show_help
@@ -341,7 +435,7 @@ ufw --force enable
 ufw allow ssh
 ufw allow 26657/tcp comment "Miden RPC"
 
-# Create systemd service
+# Create systemd service (FIXED)
 log "Creating systemd service..."
 cat > /etc/systemd/system/miden-node.service << 'SERVICE'
 [Unit]
@@ -355,7 +449,7 @@ User=root
 Group=root
 WorkingDirectory=/root/miden
 Environment=PATH=/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-ExecStart=/root/.cargo/bin/miden-node bundled start --rpc.url http://0.0.0.0:26657 --data-directory /root/miden/data --block.interval 5s --batch.interval 2s --max-txs-per-batch 8 --max-batches-per-block 8
+ExecStart=/root/.cargo/bin/miden-node start --config /root/miden/config/miden-node.toml
 Restart=always
 RestartSec=10
 LimitNOFILE=65535
@@ -375,6 +469,24 @@ systemctl enable miden-node
 log "Final setup..."
 echo 'export PATH="/root/.cargo/bin:$PATH"' >> ~/.bashrc
 echo 'alias miden="/root/miden.sh"' >> ~/.bashrc
+
+# Create log rotation
+cat > /etc/logrotate.d/miden-node << 'LOGROTATE'
+/root/miden/logs/*.log {
+    daily
+    missingok
+    rotate 7
+    compress
+    delaycompress
+    notifempty
+    create 0644 root root
+    postrotate
+        if [ -f /root/miden/miden-node.pid ]; then
+            kill -USR1 $(cat /root/miden/miden-node.pid) 2>/dev/null || true
+        fi
+    endscript
+}
+LOGROTATE
 
 log "Installation completed successfully!"
 echo ""
@@ -398,12 +510,16 @@ echo ""
 echo -e "${GREEN}Files Location:${NC}"
 echo "  Data: /root/miden/data/"
 echo "  Accounts: /root/miden/accounts/"
+echo "  Config: /root/miden/config/"
 echo "  Logs: /root/miden/logs/"
 echo ""
 echo -e "${YELLOW}Important:${NC} Backup your faucet key!"
-echo "  cat /root/miden/accounts/faucet_miden.mac"
+echo "  miden faucet"
 echo ""
 echo -e "${GREEN}To start using:${NC}"
 echo "  source ~/.bashrc"
 echo "  miden start"
+echo ""
+echo -e "${YELLOW}Note:${NC} Check the logs if the node fails to start:"
+echo "  miden logs"
 echo ""
